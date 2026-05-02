@@ -6,7 +6,13 @@
       "PowerShell(npx tsc --noEmit 2>&1)",
       "PowerShell(npm run *)",
       "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:3000/)",
-      "Bash(curl *)"
+      "Bash(curl *)",
+      "PowerShell(Test-Path \"D:\\\\IdeaProjects\\\\boobarbitrage\\\\node_modules\\\\recharts\\\\package.json\"; \\(Get-Content \"D:\\\\IdeaProjects\\\\boobarbitrage\\\\node_modules\\\\recharts\\\\package.json\" -Raw | ConvertFrom-Json\\).version)",
+      "PowerShell(npx next build 2>&1 | Select-Object -Last 60)",
+      "Read(//tmp/**)",
+      "PowerShell($page = Invoke-WebRequest -Uri \"http://localhost:3000/\" -UseBasicParsing; \"Status: $\\($page.StatusCode\\)\"; \"ContentLength: $\\($page.Content.Length\\)\"; if \\($page.Content -match 'BOOBArbitrage'\\) { \"Title found: BOOBArbitrage\" } else { \"WARN: Title not found in HTML\" }; if \\($page.Content -match 'Carry-to-Risk'\\) { \"CTR section: present\" } else { \"WARN: CTR section not in static HTML \\(likely client-rendered\\)\" })",
+      "PowerShell($api = Invoke-WebRequest -Uri \"http://localhost:3000/api/carry?symbol=SOL\" -UseBasicParsing; \"API status: $\\($api.StatusCode\\)\"; $j = $api.Content | ConvertFrom-Json; \"ctr=$\\($j.ctr\\) basis=$\\($j.basis\\) breakeven=$\\($j.breakevenHours\\) dataPoints=$\\($j.dataPoints\\)\")",
+      "PowerShell(Get-Process *)"
     ]
   }
 }

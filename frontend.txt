@@ -1,0 +1,202 @@
+Build the frontend for BOOBArbitrage — a single-page carry trade analytics dashboard. The API endpoint at `/api/carry?symbol=SOL` already returns all the data. This is a pure frontend task.
+
+**Design principles:**
+- Dark theme matching BOOBAnalytics (bg-[#0d1117], text-[#c9d1d9])
+- Professional, clean, information-dense but not cluttered
+- Single scrollable page, no tabs or navigation
+- Every metric has a 'How is this computed?' expandable section with three levels: what it means, how we computed it, and the academic source
+- Responsive — works on desktop and mobile
+
+**Page structure:**
+
+**Header (sticky, compact):**
+- Logo/title: 'BOOBArbitrage' with subtitle 'Carry Trade Analytics for Pacifica'
+- Asset selector (dropdown, currently only SOL — but build it as a dropdown so adding assets later is trivial)
+- Last updated timestamp with a refresh button
+- Link to BOOBAnalytics (external link to the analytics app)
+
+**Section 1: Opportunity (top section)**
+
+**Headline card — full width:**
+- Left side: CTR (Carry-to-Risk Ratio) displayed large (e.g., -0.29)
+  - Color: green if > 1.0, yellow if 0.5-1.0, orange if 0-0.5, red if < 0
+  - Label: 'Carry-to-Risk Ratio'
+  - Methodology popup: 'Net carry divided by SOL price volatility. Measures carry received per unit of price risk. Source: Curcuru, Vega & Hoek (2010), Federal Reserve Board / BIS.'
+
+- Right side: Quick verdict text
+  - CTR > 1: 'Strong opportunity — carry significantly exceeds price risk'
+  - CTR 0.5-1: 'Moderate opportunity — carry exceeds price risk'
+  - CTR 0-0.5: 'Weak opportunity — carry barely covers price risk'
+  - CTR < 0: 'No opportunity — carry is negative after borrow costs'
+
+**Metrics grid (3 columns on desktop, 1 on mobile):**
+
+Card 1 — Net Carry:
+- Hourly rate (e.g., '-0.0016%')
+- Annualized rate (e.g., '-14.0%')
+- Sub-line: 'Funding: X% — Borrow: Y%' showing the two components
+- Color: green if positive, red if negative
+- Methodology popup: 'Funding rate received minus borrow rate paid. Hourly funding from Pacifica settlement; borrow rate from the money market based on current utilization.'
+
+Card 2 — Lo-Adjusted Sharpe:
+- Adjusted value prominent (e.g., '2.19')
+- Naive value crossed out or grayed (e.g., '~naive: 8.05~')
+- Sub-line: 'Autocorrelation: ρ = 0.86'
+- Methodology popup: 'Sharpe ratio corrected for autocorrelation in funding rates. Naive annualization overstates Sharpe by √T when returns are serially correlated. Source: Lo, A.W. (2002), "The Statistics of Sharpe Ratios," Financial Analysts Journal.'
+
+Card 3 — Basis Spread:
+- Current basis in bps (e.g., '+2.4 bps')
+- Label: 'Perp premium over spot'
+- Color: green if positive (shorts get premium), red if negative
+- Methodology popup: 'Difference between perp price and spot price as a percentage. Positive basis means perp trades above spot — favorable for carry (shorts).'
+
+**Yield Calculator — full width card below the metrics grid:**
+- Input field: 'Capital ($)' — default 10,000, user-editable
+- Fee inputs (collapsible advanced section): spot fee rate, perp fee rate — defaults 0.05%
+- Output grid (4 columns): Hourly | Daily | Weekly | Monthly yield in USD
+- Annualized yield percentage
+- All values update reactively as user changes capital
+- If net carry is negative, show yields in red with note: 'Carry is currently negative — you would be paying, not earning'
+- Methodology popup: 'Projected yield at current rates. Assumes rates remain constant (they won't — see Duration section for persistence estimates).'
+
+**Funding Rate Chart — full width:**
+- Line chart (recharts) showing funding rate history
+- X-axis: time (last 30 days, or all available data)
+- Y-axis: hourly funding rate (%)
+- Horizontal line at 0 (break-even before borrow costs)
+- Horizontal dashed line at current borrow rate / 8760 (break-even after borrow costs)
+- Tooltip showing rate, date/time, and whether carry was positive or negative at that point
+- Color: line segments green when above borrow-adjusted breakeven, red when below
+
+**Section 2: Risk Assessment (middle section)**
+
+**Section header:** 'Risk Assessment' with a one-line summary:
+- If CTR > 0.5: 'Carry is favorable — monitor utilization and funding direction'
+- If CTR 0-0.5: 'Marginal carry — costs may exceed yield'  
+- If CTR < 0: 'Carry is negative — no trade recommended at current rates'
+
+**Risk metrics grid (2 columns desktop, 1 mobile):**
+
+Card 1 — Utilization Risk:
+- Current utilization as a gauge/progress bar (e.g., '1.0%')
+- Distance to 80% kink: 'X pp to accelerated borrow rate'
+- Distance to 90% cutoff: 'X pp to position freeze'
+- Current borrow APR
+- Borrow APR at 80%: '10.95%' (from docs)
+- Borrow APR at 90%: show computed value
+- Color: green if util < 50%, yellow if 50-75%, orange if 75-85%, red if > 85%
+- Methodology popup: 'Pacifica uses a kinked utilization curve for borrow rates. Below 80% utilization, rates increase linearly. Above 80%, rates accelerate sharply. Above 90%, new borrowing positions are frozen. Based on Compound V3 / Aave V3 interest rate model.'
+
+Card 2 — Liquidation Distance:
+- 'SOL would need to move X% for liquidation'
+- Show the price level
+- Note: 'Delta-neutral carry has very low liquidation risk — requires a ~5-6x price move due to 20% LTV haircut on spot collateral'
+- Color: always green unless somehow < 100% (which would mean already at risk)
+- Methodology popup: 'Perp losses count at 100% but spot collateral only counts at 80% LTV. The 20% gap means extreme price moves can erode effective equity. For a delta-neutral carry, this requires a ~5-6x upward price move.'
+
+Card 3 — Tail Risk:
+- CVaR (95%): average loss in worst 5% of periods (e.g., '-0.003%/hour')
+- Realized skewness (e.g., '-0.45')
+- Warning if skewness is significantly negative (< -0.5): '⚠ Negative skewness detected — high carry historically predicts crash risk (Brunnermeier et al., 2008)'
+- Methodology popup: 'CVaR (Conditional Value at Risk) = average loss in the worst 5% of historical hourly returns. Adopted as the regulatory tail-risk measure under Basel III. Skewness measures asymmetry — negative skewness means large losses are more common than large gains. Source: Acerbi & Tasche (2002); Brunnermeier, Nagel & Pedersen (2008), NBER.'
+
+Card 4 — BIS Warning:
+- Static informational card
+- Text: 'BIS Working Paper 1087 finds that high carry predicts a 22% increase in liquidations of short futures positions over the following month.'
+- Subtle styling — not alarmist, just informational
+- Link: 'Read the paper →' linking to bis.org/publ/work1087.htm
+
+**Section 3: Duration & Breakeven (bottom section)**
+
+**Section header:** 'Duration & Breakeven' with summary:
+- If breakevenVsHalfLife === 'favorable': '✓ Carry likely to persist long enough to recoup entry costs'
+- If 'marginal': '⚠ Breakeven and funding persistence are roughly equal — marginal trade'
+- If 'unfavorable': '✗ Funding may decay before you break even'
+- If null (carry negative): 'Carry is negative — no breakeven analysis applicable'
+
+**Metrics grid (3 columns desktop, 1 mobile):**
+
+Card 1 — OU Half-Life:
+- Value in hours (e.g., '5.0 hours')
+- 95% CI: show ± 2 standard errors converted to half-life bounds
+- Sub-line: 'Long-run mean: X%/hr'
+- Interpretation: 'Funding rate tends to revert halfway to its mean in ~X hours'
+- Methodology popup: 'Ornstein-Uhlenbeck mean-reversion model fitted via AR(1) regression on hourly funding rates. Half-life = -ln(2)/λ where λ is the mean-reversion speed. Source: Chan, E. (2013), "Algorithmic Trading"; standard in pairs trading and fixed-income analytics.'
+
+Card 2 — Z-Score:
+- Current z-score (e.g., '-0.5')
+- Color: green if > 1.5 (elevated opportunity), yellow if 0.5-1.5, gray if -0.5 to 0.5, red if < -0.5
+- Interpretation based on value:
+  - z > 2: 'Funding is very elevated — strong entry signal'
+  - z > 1: 'Funding is above average — moderate signal'
+  - |z| < 0.5: 'Funding is near its historical average'
+  - z < -1: 'Funding is below average — poor carry conditions'
+  - z < -2: 'Funding is very depressed — avoid carry'
+- Methodology popup: 'Time-series z-score: how many standard deviations the current funding rate is from its 30-day rolling mean. Source: Koijen, Moskowitz, Pedersen & Vrugt (2018), "Carry," Journal of Financial Economics.'
+
+Card 3 — Breakeven:
+- Hours to breakeven (e.g., '6.2 hours') or 'N/A' if carry negative
+- Comparison to half-life: 'Breakeven: X hrs vs Half-life: Y hrs'
+- Visual: simple bar or comparison showing the two values
+- Green if breakeven < half-life, red if breakeven > half-life
+- Methodology popup: 'Minimum hold time to recoup entry/exit fees at current carry rate. T_min = round-trip fees / hourly net carry. Compare against OU half-life: if breakeven < half-life, carry is expected to persist long enough to profit. Source: He, Manela, Ross & von Wachter (2022), "Fundamentals of Perpetual Futures."'
+
+**Basis History Chart — full width:**
+- Line chart showing basis spread over time (same timeframe as funding chart)
+- Y-axis: basis in bps
+- Horizontal line at 0
+
+**Footer:**
+- 'Built for Pacifica's unified margin'
+- 'Methodology based on: Curcuru/Vega/Hoek (2010), Lo (2002), Brunnermeier/Nagel/Pedersen (2008), He/Manela/Ross/von Wachter (2022), Christin/Routledge/Soska/Zetlin-Jones (2022)'
+- 'Data from Pacifica API — not financial advice'
+- Link to BOOBAnalytics
+
+**Implementation details:**
+
+**Data fetching:**
+- Client component fetches from `/api/carry?symbol=SOL` on mount
+- Show a loading skeleton while data loads
+- Auto-refresh every 5 minutes (funding rate changes hourly, no need for real-time)
+- Error state with retry button
+
+**Methodology popup component:**
+Create a reusable `MethodologyPopup` component:
+
+```typescript
+interface MethodologyPopupProps {
+  whatItMeans: string;
+  howComputed: string;
+  source: string;
+  sourceUrl?: string;
+}
+```
+
+Renders as a small '?' icon or 'How is this computed?' link. On click, expands inline (not a modal) showing the three levels. Collapsible. Multiple can be open simultaneously.
+
+Style the expanded section with a subtle left border (blue) and slightly indented text. Source line in italic with optional hyperlink.
+
+**Yield calculator:**
+- Use React state for capital amount and fee rates
+- Compute yields client-side from the API response data (netCarryHourly × capital)
+- Debounce the input to avoid excessive re-renders
+- Format USD values with commas and 2 decimal places
+
+**Charts:**
+- Use recharts ResponsiveContainer + LineChart
+- Dark theme: dark grid lines, light axis text, green/red line coloring
+- Tooltip styled to match the dark theme
+- Both charts should be the same width and aligned vertically
+
+**Responsive layout:**
+- Use Tailwind grid: `grid-cols-1 md:grid-cols-2 lg:grid-cols-3` for metric cards
+- Charts always full width
+- Yield calculator full width
+- On mobile, everything stacks vertically
+
+**Do NOT:**
+- Add authentication or wallet connection
+- Add a database
+- Change the API endpoint
+- Add additional API endpoints
+- Add any backend logic
