@@ -8,15 +8,24 @@
     "start": "next start"
   },
   "dependencies": {
+    "bs58": "^6.0.0",
     "next": "16.2.4",
     "react": "19.2.4",
-    "react-dom": "19.2.4"
+    "react-dom": "19.2.4",
+    "recharts": "^3.8.1",
+    "simple-statistics": "^7.8.9",
+    "tweetnacl": "^1.0.3",
+    "uuid": "^14.0.0",
+    "ws": "^8.20.0",
+    "zod": "^4.4.2"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "@types/uuid": "^10.0.0",
+    "@types/ws": "^8.18.1",
     "tailwindcss": "^4",
     "typescript": "^5"
   }

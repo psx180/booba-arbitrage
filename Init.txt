@@ -1,0 +1,563 @@
+Set up a new Next.js project called BOOBArbitrage — a carry trade analytics tool for Pacifica's unified margin.
+
+**Step 1: Initialize the project.**
+
+```bash
+npx create-next-app@latest boobarbitrage --typescript --tailwind --app --src-dir --no-eslint
+cd boobarbitrage
+npm install recharts simple-statistics
+```
+
+**Step 2: Copy the Pacifica client.**
+
+Copy the Pacifica API client from the BOOBAnalytics project. The relevant files are in `../pacibooba/src/services/pacifica/`. Copy the entire directory to `src/services/pacifica/` in the new project. We need:
+- `client.ts` — PacificaClient
+- `rest/` — all REST API wrappers
+- `types/` — all Zod schemas and types
+
+After copying, verify it compiles. Remove any imports that reference BOOBAnalytics-specific code (Prisma, internal types). The Pacifica client should be self-contained.
+
+**Step 3: Add three new API methods to the Pacifica client.**
+
+**3a. Funding rate history** — add to `rest/markets.ts` (or appropriate file):
+
+```typescript
+async getHistoricalFunding(params: {
+  symbol: string;
+  limit?: number;
+  cursor?: string;
+}): Promise<{
+  data: Array<{
+    oracle_price: string;
+    bid_impact_price: string;
+    ask_impact_price: string;
+    funding_rate: string;
+    next_funding_rate: string;
+    created_at: number;
+  }>;
+  next_cursor: string | null;
+  has_more: boolean;
+}> {
+  return this.get('/funding_rate/history', params);
+}
+
+// Paginated version that fetches all history
+async getAllHistoricalFunding(symbol: string): Promise<Array<{
+  funding_rate: number;
+  next_funding_rate: number;
+  oracle_price: number;
+  created_at: number;
+}>> {
+  const all = [];
+  let cursor: string | undefined;
+  do {
+    const page = await this.getHistoricalFunding({ symbol, limit: 4000, cursor });
+    all.push(...page.data.map(d => ({
+      funding_rate: parseFloat(d.funding_rate),
+      next_funding_rate: parseFloat(d.next_funding_rate),
+      oracle_price: parseFloat(d.oracle_price),
+      created_at: d.created_at,
+    })));
+    cursor = page.next_cursor ?? undefined;
+    if (!page.has_more) break;
+  } while (cursor);
+  return all;
+}
+```
+
+**3b. Loan pool** — add `getLoanPool()`:
+
+```typescript
+async getLoanPool(): Promise<{
+  total_borrowed: number;
+  total_borrowable: number;
+  utilization: number;
+  borrow_rate_apr: number;
+  borrow_rate_apy: number;
+  lend_rate_apr: number;
+  lend_rate_apy: number;
+  utilization_max: number;
+}> {
+  const res = await this.get('/loan_pool');
+  return {
+    total_borrowed: parseFloat(res.data.total_borrowed),
+    total_borrowable: parseFloat(res.data.total_borrowable),
+    utilization: parseFloat(res.data.utilization),
+    borrow_rate_apr: parseFloat(res.data.borrow_rate_apr),
+    borrow_rate_apy: parseFloat(res.data.borrow_rate_apy),
+    lend_rate_apr: parseFloat(res.data.lend_rate_apr),
+    lend_rate_apy: parseFloat(res.data.lend_rate_apy),
+    utilization_max: parseFloat(res.data.utilization_max),
+  };
+}
+```
+
+**3c. Spot assets** — add `getSpotAssets()`:
+
+```typescript
+async getSpotAssets(): Promise<Array<{
+  symbol: string;
+  active: boolean;
+  collateral_enabled: boolean;
+  ltv_ratio: number;
+}>> {
+  const res = await this.get('/spot_assets');
+  return res.data.map((a: any) => ({
+    symbol: a.symbol,
+    active: a.active,
+    collateral_enabled: a.collateral_enabled,
+    ltv_ratio: parseFloat(a.ltv_ratio),
+  }));
+}
+```
+
+**Step 4: Build the core computation module.**
+
+Create `src/lib/carry-math.ts` — pure functions, no I/O, fully testable:
+
+```typescript
+/**
+ * Carry trade analytics — core computations.
+ * 
+ * All formulas are from published institutional/academic sources.
+ * Each function documents its citation.
+ */
+
+// ─── Carry-to-Risk Ratio ─────────────────────────────────────────────
+// Source: Curcuru, Vega & Hoek (2010), Federal Reserve Board / BIS
+// CTR = (annualized net carry) / (annualized price volatility)
+
+export function carryToRisk(
+  hourlyFundingRate: number,
+  borrowRateApr: number,
+  annualizedVolatility: number,
+): number {
+  const annualizedCarry = hourlyFundingRate * 8760 - borrowRateApr;
+  if (annualizedVolatility <= 0) return 0;
+  return annualizedCarry / annualizedVolatility;
+}
+
+// ─── Net Carry ────────────────────────────────────────────────────────
+
+export function netCarryHourly(
+  hourlyFundingRate: number,
+  borrowRateApr: number,
+): number {
+  return hourlyFundingRate - borrowRateApr / 8760;
+}
+
+export function netCarryAnnualized(
+  hourlyFundingRate: number,
+  borrowRateApr: number,
+): number {
+  return hourlyFundingRate * 8760 - borrowRateApr;
+}
+
+// ─── Lo-adjusted Sharpe Ratio ─────────────────────────────────────────
+// Source: Lo, A.W. (2002), "The Statistics of Sharpe Ratios,"
+//         Financial Analysts Journal 58(4), 36-52.
+// Corrects for autocorrelation in the return series.
+
+export function loAdjustedSharpe(
+  returns: number[],
+  periodsPerYear: number = 8760, // hourly
+): { naive: number; adjusted: number; autocorrelation: number } | null {
+  if (returns.length < 30) return null;
+  
+  const n = returns.length;
+  const mean = returns.reduce((s, r) => s + r, 0) / n;
+  const variance = returns.reduce((s, r) => s + (r - mean) ** 2, 0) / (n - 1);
+  const std = Math.sqrt(variance);
+  
+  if (std <= 0) return null;
+  
+  // AR(1) autocorrelation
+  let sumProduct = 0;
+  let sumSq = 0;
+  for (let i = 1; i < n; i++) {
+    sumProduct += (returns[i] - mean) * (returns[i - 1] - mean);
+    sumSq += (returns[i - 1] - mean) ** 2;
+  }
+  const rho = sumSq > 0 ? sumProduct / sumSq : 0;
+  
+  const naiveSharpe = (mean / std) * Math.sqrt(periodsPerYear);
+  
+  // Lo adjustment factor: η(q) = q / sqrt(q + 2·Σ_{k=1}^{q-1} (q-k)·ρ^k)
+  const q = periodsPerYear;
+  let sumCorrection = 0;
+  for (let k = 1; k < Math.min(q, 100); k++) { // cap at 100 lags for performance
+    sumCorrection += (q - k) * Math.pow(rho, k);
+  }
+  const denominator = Math.sqrt(q + 2 * sumCorrection);
+  const eta = denominator > 0 ? q / denominator : 1;
+  // The adjustment ratio is eta / sqrt(q), applied to the naive Sharpe
+  // Actually: SR_adjusted = (mean/std) * eta
+  // SR_naive = (mean/std) * sqrt(q)
+  // So: SR_adjusted = SR_naive * (eta / sqrt(q))
+  const adjustmentRatio = eta / Math.sqrt(q);
+  const adjustedSharpe = naiveSharpe * adjustmentRatio;
+  
+  return {
+    naive: naiveSharpe,
+    adjusted: adjustedSharpe,
+    autocorrelation: rho,
+  };
+}
+
+// ─── OU Half-Life ─────────────────────────────────────────────────────
+// Source: Chan, E. (2013), "Algorithmic Trading"
+// Fit AR(1): Δr_t = α + λ·r_{t-1} + ε_t
+// half_life = -ln(2) / λ
+
+export function ouHalfLife(
+  series: number[],
+): { halfLife: number; lambda: number; mu: number; standardError: number } | null {
+  if (series.length < 30) return null;
+  
+  const n = series.length - 1;
+  const deltaY: number[] = [];
+  const yLag: number[] = [];
+  
+  for (let i = 1; i < series.length; i++) {
+    deltaY.push(series[i] - series[i - 1]);
+    yLag.push(series[i - 1]);
+  }
+  
+  // OLS regression: deltaY = alpha + lambda * yLag + epsilon
+  const meanDelta = deltaY.reduce((s, v) => s + v, 0) / n;
+  const meanLag = yLag.reduce((s, v) => s + v, 0) / n;
+  
+  let ssXY = 0, ssXX = 0;
+  for (let i = 0; i < n; i++) {
+    ssXY += (yLag[i] - meanLag) * (deltaY[i] - meanDelta);
+    ssXX += (yLag[i] - meanLag) ** 2;
+  }
+  
+  if (ssXX === 0) return null;
+  
+  const lambda = ssXY / ssXX;
+  const alpha = meanDelta - lambda * meanLag;
+  
+  // lambda must be negative for mean-reversion
+  if (lambda >= 0) return null;
+  
+  const halfLife = -Math.log(2) / lambda;
+  const mu = -alpha / lambda; // long-run mean
+  
+  // Standard error of lambda
+  const residuals = deltaY.map((dy, i) => dy - alpha - lambda * yLag[i]);
+  const residualVariance = residuals.reduce((s, r) => s + r * r, 0) / (n - 2);
+  const standardError = Math.sqrt(residualVariance / ssXX);
+  
+  return { halfLife, lambda, mu, standardError };
+}
+
+// ─── Z-Score ──────────────────────────────────────────────────────────
+// Source: Koijen, Moskowitz, Pedersen & Vrugt (2018), "Carry," JFE
+// Time-series z-score of current rate vs rolling window
+
+export function zScore(
+  currentValue: number,
+  series: number[],
+): number | null {
+  if (series.length < 20) return null;
+  const mean = series.reduce((s, v) => s + v, 0) / series.length;
+  const std = Math.sqrt(
+    series.reduce((s, v) => s + (v - mean) ** 2, 0) / (series.length - 1)
+  );
+  if (std <= 0) return null;
+  return (currentValue - mean) / std;
+}
+
+// ─── Breakeven Hold Time ──────────────────────────────────────────────
+// Source: He, Manela, Ross & von Wachter (2022),
+//         "Fundamentals of Perpetual Futures"
+// T_min = round_trip_cost / hourly_net_carry
+
+export function breakevenHours(
+  spotFeeRate: number,      // e.g., 0.0005 for 0.05%
+  perpFeeRate: number,      // e.g., 0.0005 for 0.05%
+  hourlyNetCarry: number,   // funding_rate - borrow_rate/8760
+  capitalUsd: number,
+): number | null {
+  if (hourlyNetCarry <= 0) return null; // carry is negative, no breakeven
+  
+  // Round trip: buy spot + sell spot + open short + close short
+  const roundTripCostRate = 2 * spotFeeRate + 2 * perpFeeRate;
+  const roundTripCostUsd = roundTripCostRate * capitalUsd;
+  const hourlyYieldUsd = hourlyNetCarry * capitalUsd;
+  
+  return roundTripCostUsd / hourlyYieldUsd;
+}
+
+// ─── Basis ────────────────────────────────────────────────────────────
+
+export function basisSpread(
+  perpPrice: number,
+  spotPrice: number,
+): number {
+  if (spotPrice <= 0) return 0;
+  return (perpPrice - spotPrice) / spotPrice;
+}
+
+// ─── Liquidation Distance ─────────────────────────────────────────────
+// For delta-neutral carry on unified margin:
+// Spot collateral value = SOL_amount × price × LTV
+// Simplified: how much can price move before margin is insufficient
+
+export function liquidationDistance(
+  spotAmount: number,
+  spotPrice: number,
+  ltvRatio: number,
+  perpNotional: number,
+  maintenanceMarginRate: number, // e.g., 0.03 for 3%
+): number {
+  // Collateral value at current price
+  const collateralValue = spotAmount * spotPrice * ltvRatio;
+  const requiredMaintenance = perpNotional * maintenanceMarginRate;
+  const buffer = collateralValue - requiredMaintenance;
+  
+  if (perpNotional <= 0) return 0;
+  return buffer / perpNotional;
+}
+
+// ─── CVaR (Conditional Value at Risk) ─────────────────────────────────
+// Source: Acerbi & Tasche (2002); Basel III FRTB standard
+// CVaR_α = average loss in the worst α% of observations
+
+export function cvar(
+  returns: number[],
+  alpha: number = 0.05, // 5% tail
+): number | null {
+  if (returns.length < 20) return null;
+  
+  const sorted = [...returns].sort((a, b) => a - b);
+  const cutoffIndex = Math.max(1, Math.floor(sorted.length * alpha));
+  const tailReturns = sorted.slice(0, cutoffIndex);
+  
+  return tailReturns.reduce((s, r) => s + r, 0) / tailReturns.length;
+}
+
+// ─── Realized Skewness ───────────────────────────────────────────────
+// Source: Brunnermeier, Nagel & Pedersen (2008), NBER WP 14473
+// High carry predicts negative skewness
+
+export function realizedSkewness(returns: number[]): number | null {
+  if (returns.length < 30) return null;
+  
+  const n = returns.length;
+  const mean = returns.reduce((s, r) => s + r, 0) / n;
+  const m2 = returns.reduce((s, r) => s + (r - mean) ** 2, 0) / n;
+  const m3 = returns.reduce((s, r) => s + (r - mean) ** 3, 0) / n;
+  const std = Math.sqrt(m2);
+  
+  if (std <= 0) return null;
+  return (n * m3) / ((n - 1) * (n - 2) * std ** 3) * n; // sample skewness
+}
+
+// ─── Annualized Volatility from Candles ───────────────────────────────
+
+export function annualizedVolatility(dailyReturns: number[]): number {
+  if (dailyReturns.length < 2) return 0;
+  const mean = dailyReturns.reduce((s, r) => s + r, 0) / dailyReturns.length;
+  const variance = dailyReturns.reduce((s, r) => s + (r - mean) ** 2, 0) / (dailyReturns.length - 1);
+  return Math.sqrt(variance) * Math.sqrt(365); // crypto trades 365 days
+}
+
+// ─── Yield Projection ─────────────────────────────────────────────────
+
+export function yieldProjection(
+  capitalUsd: number,
+  hourlyNetCarry: number,
+): { hourly: number; daily: number; weekly: number; monthly: number; annualized: number } {
+  return {
+    hourly: capitalUsd * hourlyNetCarry,
+    daily: capitalUsd * hourlyNetCarry * 24,
+    weekly: capitalUsd * hourlyNetCarry * 24 * 7,
+    monthly: capitalUsd * hourlyNetCarry * 24 * 30,
+    annualized: capitalUsd * hourlyNetCarry * 8760,
+  };
+}
+```
+
+**Step 5: Build the data fetching layer.**
+
+Create `src/lib/carry-data.ts` — fetches all needed data from Pacifica and computes derived values:
+
+```typescript
+import { PacificaClient } from '@/services/pacifica';
+import * as math from './carry-math';
+
+export interface CarryAnalysis {
+  // Raw data
+  currentFundingRate: number;       // hourly rate
+  nextFundingRate: number;          // predicted next hour
+  borrowRateApr: number;
+  lendRateApr: number;
+  utilization: number;
+  spotPrice: number;
+  perpPrice: number;
+  ltvRatio: number;
+  
+  // Computed — Opportunity
+  netCarryHourly: number;
+  netCarryAnnualized: number;
+  ctr: number;
+  annualizedVol: number;
+  basis: number;
+  sharpe: { naive: number; adjusted: number; autocorrelation: number } | null;
+  zScore: number | null;
+  
+  // Computed — Risk
+  cvar95: number | null;
+  skewness: number | null;
+  utilizationToKink: number;       // distance to 80%
+  utilizationToCutoff: number;     // distance to 90%
+  
+  // Computed — Duration
+  ouResult: { halfLife: number; lambda: number; mu: number; standardError: number } | null;
+  breakevenHours: number | null;
+  breakevenVsHalfLife: 'favorable' | 'marginal' | 'unfavorable' | null;
+  
+  // Yield projection (at $10,000 default)
+  yieldProjection: { hourly: number; daily: number; weekly: number; monthly: number; annualized: number };
+  
+  // Metadata
+  fundingHistory: Array<{ rate: number; timestamp: number }>;
+  dataPoints: number;
+  oldestDataPoint: number;
+}
+
+export async function fetchCarryAnalysis(symbol: string = 'SOL'): Promise<CarryAnalysis> {
+  const client = new PacificaClient({ /* config */ });
+  
+  // Fetch all data in parallel
+  const [fundingHistory, loanPool, spotAssets, spotCandles, perpCandles] = await Promise.all([
+    client.markets.getAllHistoricalFunding(symbol),
+    client.markets.getLoanPool(),
+    client.markets.getSpotAssets(),
+    client.markets.getKline({ symbol: `${symbol}-USDC`, interval: '1d', /* last 30 days */ }),
+    client.markets.getKline({ symbol, interval: '1d', /* last 30 days */ }),
+  ]);
+  
+  // Current values
+  const latest = fundingHistory[fundingHistory.length - 1];
+  const currentFundingRate = latest.funding_rate;
+  const nextFundingRate = latest.next_funding_rate;
+  const borrowRateApr = loanPool.borrow_rate_apr;
+  const lendRateApr = loanPool.lend_rate_apr;
+  const utilization = loanPool.utilization;
+  
+  const spotAsset = spotAssets.find(a => a.symbol === symbol);
+  const ltvRatio = spotAsset?.ltv_ratio ?? 0.80;
+  
+  // Prices from latest candles
+  const spotPrice = spotCandles[spotCandles.length - 1]?.close ?? 0;
+  const perpPrice = perpCandles[perpCandles.length - 1]?.close ?? 0;
+  
+  // Daily returns for volatility
+  const dailyReturns = perpCandles.slice(1).map((c, i) => 
+    (c.close - perpCandles[i].close) / perpCandles[i].close
+  );
+  const annualizedVol = math.annualizedVolatility(dailyReturns);
+  
+  // Funding rate series for OU and Sharpe
+  const fundingRates = fundingHistory.map(f => f.funding_rate);
+  
+  // Hourly carry returns for Sharpe/CVaR
+  const hourlyBorrowRate = borrowRateApr / 8760;
+  const carryReturns = fundingRates.map(r => r - hourlyBorrowRate);
+  
+  // Compute everything
+  const netHourly = math.netCarryHourly(currentFundingRate, borrowRateApr);
+  const netAnnual = math.netCarryAnnualized(currentFundingRate, borrowRateApr);
+  const ctr = math.carryToRisk(currentFundingRate, borrowRateApr, annualizedVol);
+  const basis = math.basisSpread(perpPrice, spotPrice);
+  const sharpe = math.loAdjustedSharpe(carryReturns);
+  const z = math.zScore(currentFundingRate, fundingRates.slice(-720)); // 30-day window
+  const cvar95 = math.cvar(carryReturns);
+  const skewness = math.realizedSkewness(carryReturns);
+  const ouResult = math.ouHalfLife(fundingRates);
+  const breakeven = math.breakevenHours(0.0005, 0.0005, netHourly, 10000);
+  
+  let breakevenVsHalfLife: 'favorable' | 'marginal' | 'unfavorable' | null = null;
+  if (breakeven !== null && ouResult !== null) {
+    if (breakeven < ouResult.halfLife * 0.5) breakevenVsHalfLife = 'favorable';
+    else if (breakeven < ouResult.halfLife * 1.5) breakevenVsHalfLife = 'marginal';
+    else breakevenVsHalfLife = 'unfavorable';
+  }
+  
+  return {
+    currentFundingRate,
+    nextFundingRate,
+    borrowRateApr,
+    lendRateApr,
+    utilization,
+    spotPrice,
+    perpPrice,
+    ltvRatio,
+    netCarryHourly: netHourly,
+    netCarryAnnualized: netAnnual,
+    ctr,
+    annualizedVol,
+    basis,
+    sharpe,
+    zScore: z,
+    cvar95,
+    skewness,
+    utilizationToKink: 0.80 - utilization,
+    utilizationToCutoff: 0.90 - utilization,
+    ouResult,
+    breakevenHours: breakeven,
+    breakevenVsHalfLife,
+    yieldProjection: math.yieldProjection(10000, netHourly),
+    fundingHistory: fundingHistory.map(f => ({ rate: f.funding_rate, timestamp: f.created_at })),
+    dataPoints: fundingHistory.length,
+    oldestDataPoint: fundingHistory[0]?.created_at ?? 0,
+  };
+}
+```
+
+**Step 6: Create an API route.**
+
+Create `src/app/api/carry/route.ts`:
+
+```typescript
+import { NextResponse } from 'next/server';
+import { fetchCarryAnalysis } from '@/lib/carry-data';
+
+export async function GET(req: Request) {
+  const { searchParams } = new URL(req.url);
+  const symbol = searchParams.get('symbol') ?? 'SOL';
+  
+  try {
+    const analysis = await fetchCarryAnalysis(symbol);
+    return NextResponse.json(analysis);
+  } catch (error) {
+    console.error('[carry] Analysis failed:', error);
+    return NextResponse.json({ error: 'Analysis failed' }, { status: 500 });
+  }
+}
+```
+
+**Important notes:**
+
+- All math functions in `carry-math.ts` are pure — no I/O, no side effects. Easy to unit test.
+- `carry-data.ts` handles all Pacifica API calls and passes results to the pure math functions.
+- The API route is a thin wrapper.
+- Don't build the frontend yet — we'll verify the math produces reasonable numbers first via the API endpoint.
+- Use fee rates of 0.05% (5 bps) as defaults — check Pacifica's actual fee schedule and adjust.
+- The Pacifica client copy might need adjustment depending on how it's structured in BOOBAnalytics. The key is that it compiles standalone without any BOOBAnalytics dependencies.
+
+**Verify by running the dev server and hitting `http://localhost:3000/api/carry?symbol=SOL`**. Check that:
+- Funding rate is a small number (e.g., 0.00001 to 0.001 per hour)
+- Borrow rate APR is between 1% and 50%
+- CTR is a reasonable ratio (could be negative if carry < 0)
+- Half-life is in hours (e.g., 10-100 hours)
+- Breakeven is in hours (e.g., 2-50 hours)
+
+**Do NOT:**
+- Build the frontend yet
+- Add a database
+- Add authentication
+- Worry about caching or performance optimization
